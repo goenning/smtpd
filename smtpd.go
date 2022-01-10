@@ -32,13 +32,13 @@ var (
 )
 
 // Handler function called upon successful receipt of an email.
-type Handler func(remoteAddr net.Addr, from string, to []string, data []byte) error
+type Handler func(s *Session, from string, to []string, data []byte) error
 
 // HandlerRcpt function called on RCPT. Return accept status.
-type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
+type HandlerRcpt func(s *Session, from string, to string) bool
 
 // AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
-type AuthHandler func(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error)
+type AuthHandler func(s *Session, mechanism string, username []byte, password []byte, shared []byte) (bool, error)
 
 var ErrServerClosed = errors.New("Server has been closed")
 
@@ -211,7 +211,7 @@ func (srv *Server) Serve(ln net.Listener) error {
 	}
 }
 
-type session struct {
+type Session struct {
 	srv           *Server
 	conn          net.Conn
 	br            *bufio.Reader
@@ -221,15 +221,17 @@ type session struct {
 	remoteName    string // Remote hostname as supplied with EHLO
 	tls           bool
 	authenticated bool
+	Context       context.Context
 }
 
 // Create new session from connection.
-func (srv *Server) newSession(conn net.Conn) (s *session) {
-	s = &session{
-		srv:  srv,
-		conn: conn,
-		br:   bufio.NewReader(conn),
-		bw:   bufio.NewWriter(conn),
+func (srv *Server) newSession(conn net.Conn) (s *Session) {
+	s = &Session{
+		srv:     srv,
+		conn:    conn,
+		br:      bufio.NewReader(conn),
+		bw:      bufio.NewWriter(conn),
+		Context: context.Background(),
 	}
 
 	// Get remote end info for the Received header.
@@ -308,7 +310,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 }
 
 // Function called to handle connection requests.
-func (s *session) serve() {
+func (s *Session) serve() {
 	defer atomic.AddInt32(&s.srv.openSessions, -1)
 	defer s.conn.Close()
 
@@ -419,7 +421,7 @@ loop:
 				} else {
 					accept := true
 					if s.srv.HandlerRcpt != nil {
-						accept = s.srv.HandlerRcpt(s.conn.RemoteAddr(), from, match[1])
+						accept = s.srv.HandlerRcpt(s, from, match[1])
 					}
 					if accept {
 						to = append(to, match[1])
@@ -473,7 +475,7 @@ loop:
 
 			// Pass mail on to handler.
 			if s.srv.Handler != nil {
-				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+				err := s.srv.Handler(s, from, to, buffer.Bytes())
 				if err != nil {
 					s.writef("451 4.3.5 Unable to process mail")
 					break
@@ -617,7 +619,7 @@ loop:
 }
 
 // Wrapper function for writing a complete line to the socket.
-func (s *session) writef(format string, args ...interface{}) error {
+func (s *Session) writef(format string, args ...interface{}) error {
 	if s.srv.Timeout > 0 {
 		s.conn.SetWriteDeadline(time.Now().Add(s.srv.Timeout))
 	}
@@ -639,7 +641,7 @@ func (s *session) writef(format string, args ...interface{}) error {
 }
 
 // Read a complete line from the socket.
-func (s *session) readLine() (string, error) {
+func (s *Session) readLine() (string, error) {
 	if s.srv.Timeout > 0 {
 		s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
 	}
@@ -663,7 +665,7 @@ func (s *session) readLine() (string, error) {
 }
 
 // Parse a line read from the socket.
-func (s *session) parseLine(line string) (verb string, args string) {
+func (s *Session) parseLine(line string) (verb string, args string) {
 	if idx := strings.Index(line, " "); idx != -1 {
 		verb = strings.ToUpper(line[:idx])
 		args = strings.TrimSpace(line[idx+1:])
@@ -675,7 +677,7 @@ func (s *session) parseLine(line string) (verb string, args string) {
 }
 
 // Read the message data following a DATA command.
-func (s *session) readData() ([]byte, error) {
+func (s *Session) readData() ([]byte, error) {
 	var data []byte
 	for {
 		if s.srv.Timeout > 0 {
@@ -710,7 +712,7 @@ func (s *session) readData() ([]byte, error) {
 
 // Create the Received header to comply with RFC 2821 section 3.8.2.
 // TODO: Work out what to do with multiple to addresses.
-func (s *session) makeHeaders(to []string) []byte {
+func (s *Session) makeHeaders(to []string) []byte {
 	var buffer bytes.Buffer
 	now := time.Now().Format("Mon, _2 Jan 2006 15:04:05 -0700 (MST)")
 	buffer.WriteString(fmt.Sprintf("Received: from %s (%s [%s])\r\n", s.remoteName, s.remoteHost, s.remoteIP))
@@ -722,7 +724,7 @@ func (s *session) makeHeaders(to []string) []byte {
 // Determine allowed authentication mechanisms.
 // RFC 4954 specifies that plaintext authentication mechanisms such as LOGIN and PLAIN require a TLS connection.
 // This can be explicitly overridden e.g. setting s.srv.AuthMechs["LOGIN"] = true.
-func (s *session) authMechs() (mechs map[string]bool) {
+func (s *Session) authMechs() (mechs map[string]bool) {
 	mechs = map[string]bool{"LOGIN": s.tls, "PLAIN": s.tls, "CRAM-MD5": true}
 
 	for mech := range mechs {
@@ -736,7 +738,7 @@ func (s *session) authMechs() (mechs map[string]bool) {
 }
 
 // Create the greeting string sent in response to an EHLO command.
-func (s *session) makeEHLOResponse() (response string) {
+func (s *Session) makeEHLOResponse() (response string) {
 	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
 
 	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
@@ -764,7 +766,7 @@ func (s *session) makeEHLOResponse() (response string) {
 	return
 }
 
-func (s *session) handleAuthLogin(arg string) (bool, error) {
+func (s *Session) handleAuthLogin(arg string) (bool, error) {
 	var err error
 
 	if arg == "" {
@@ -792,12 +794,12 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 	}
 
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "LOGIN", username, password, nil)
+	authenticated, err := s.srv.AuthHandler(s, "LOGIN", username, password, nil)
 
 	return authenticated, err
 }
 
-func (s *session) handleAuthPlain(arg string) (bool, error) {
+func (s *Session) handleAuthPlain(arg string) (bool, error) {
 	var err error
 
 	// If fast mode (AUTH PLAIN [arg]) is not used, prompt for credentials.
@@ -820,12 +822,12 @@ func (s *session) handleAuthPlain(arg string) (bool, error) {
 	}
 
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "PLAIN", parts[1], parts[2], nil)
+	authenticated, err := s.srv.AuthHandler(s, "PLAIN", parts[1], parts[2], nil)
 
 	return authenticated, err
 }
 
-func (s *session) handleAuthCramMD5() (bool, error) {
+func (s *Session) handleAuthCramMD5() (bool, error) {
 	shared := "<" + strconv.Itoa(os.Getpid()) + "." + strconv.Itoa(time.Now().Nanosecond()) + "@" + s.srv.Hostname + ">"
 
 	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte(shared)))
@@ -850,7 +852,11 @@ func (s *session) handleAuthCramMD5() (bool, error) {
 	}
 
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "CRAM-MD5", []byte(fields[0]), []byte(fields[1]), []byte(shared))
+	authenticated, err := s.srv.AuthHandler(s, "CRAM-MD5", []byte(fields[0]), []byte(fields[1]), []byte(shared))
 
 	return authenticated, err
+}
+
+func (s *Session) RemoteAddr() net.Addr {
+	return s.conn.RemoteAddr()
 }

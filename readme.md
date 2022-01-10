@@ -1,3 +1,7 @@
+> This is a fork of https://github.com/mhale/smtpd with some extra goodies:
+
+- Expose smtpd.Session so state can be shared between AuthHandler and the actual Handler
+
 # smtpd
 
 An SMTP server package written in Go, in the style of the built-in HTTP server. It meets the minimum requirements specified by RFC 2821 & 5321.
@@ -126,7 +130,7 @@ import (
     "net"
     "net/mail"
 
-    "github.com/mhale/smtpd"
+    "github.com/goenning/smtpd"
 )
 
 func mailHandler(origin net.Addr, from string, to []string, data []byte) error {

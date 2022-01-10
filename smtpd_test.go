@@ -311,8 +311,8 @@ type mockHandler struct {
 	handlerCalled int
 }
 
-func (m *mockHandler) handler(err error) func(a net.Addr, f string, t []string, d []byte) error {
-	return func(a net.Addr, f string, t []string, d []byte) error {
+func (m *mockHandler) handler(err error) func(s *Session, f string, t []string, d []byte) error {
+	return func(s *Session, f string, t []string, d []byte) error {
 		m.handlerCalled++
 		return err
 	}
@@ -540,7 +540,7 @@ func TestMakeHeaders(t *testing.T) {
 		fmt.Sprintf("%s\r\n", now)
 
 	srv := &Server{Appname: "smtpd", Hostname: "serverName"}
-	s := &session{srv: srv, remoteIP: "clientIP", remoteHost: "clientHost", remoteName: "clientName"}
+	s := &Session{srv: srv, remoteIP: "clientIP", remoteHost: "clientHost", remoteName: "clientName"}
 	headers := s.makeHeaders([]string{"recipient@example.com"})
 	if string(headers) != valid {
 		t.Errorf("makeHeaders() returned\n%v, want\n%v", string(headers), valid)
@@ -559,7 +559,7 @@ func TestParseLine(t *testing.T) {
 		{"RCPT TO:<recipient@example.com>", "RCPT", "TO:<recipient@example.com>"},
 		{"QUIT", "QUIT", ""},
 	}
-	s := &session{}
+	s := &Session{}
 	for _, tt := range tests {
 		verb, args := s.parseLine(tt.line)
 		if verb != tt.verb || args != tt.args {
@@ -571,7 +571,7 @@ func TestParseLine(t *testing.T) {
 // Test reading of complete lines from the socket.
 func TestReadLine(t *testing.T) {
 	var buf bytes.Buffer
-	s := &session{}
+	s := &Session{}
 	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
@@ -615,7 +615,7 @@ func TestReadData(t *testing.T) {
 		{"Line 1.\r\n..Line 2.\r\nLine 3.\r\n.\r\n", "Line 1.\r\n.Line 2.\r\nLine 3.\r\n"},
 	}
 	var buf bytes.Buffer
-	s := &session{}
+	s := &Session{}
 	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
@@ -656,7 +656,7 @@ func TestReadDataWithMaxSize(t *testing.T) {
 		{"Test message.\r\n.\r\n", 14, maxSizeExceeded(14)},
 	}
 	var buf bytes.Buffer
-	s := &session{}
+	s := &Session{}
 	s.br = bufio.NewReader(&buf)
 
 	for _, tt := range tests {
@@ -709,13 +709,13 @@ func parseExtensions(t *testing.T, greeting string) map[string]string {
 
 // Handler function for validating authentication credentials.
 // The secret parameter is passed as nil for LOGIN and PLAIN authentication mechanisms.
-func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
+func authHandler(s *Session, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
 	return string(username) == "valid", nil
 }
 
 // Test the extensions listed in response to an EHLO command.
 func TestMakeEHLOResponse(t *testing.T) {
-	s := &session{}
+	s := &Session{}
 	s.srv = &Server{}
 
 	// Greeting should be returned without trailing newlines.
@@ -909,7 +909,7 @@ func TestConfigureTLSWithPassphrase(t *testing.T) {
 }
 
 func TestAuthMechs(t *testing.T) {
-	s := session{}
+	s := Session{}
 	s.srv = &Server{}
 
 	// Validate that non-TLS (default) configuration does not allow plaintext authentication mechanisms.
@@ -1601,4 +1601,46 @@ func TestCmdShutdown(t *testing.T) {
 	}
 
 	conn.Close()
+}
+
+func TestShareDataBetweenHandlers(t *testing.T) {
+	ctxUsername := ""
+
+	authHandler := func(s *Session, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
+		s.Context = context.WithValue(s.Context, "username", string(username))
+		return true, nil
+	}
+
+	handler := func(s *Session, from string, to []string, data []byte) error {
+		ctxUsername = s.Context.Value("username").(string)
+		return nil
+	}
+
+	server := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, AuthHandler: authHandler, Handler: handler}
+	conn := newConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	cmdCode(t, conn, "STARTTLS", "220")
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	err := tlsConn.Handshake()
+	if err != nil {
+		t.Errorf("Failed to perform TLS handshake")
+	}
+	cmdCode(t, tlsConn, "EHLO host.example.com", "250")
+
+	cmdCode(t, tlsConn, "AUTH LOGIN", "334")
+	cmdCode(t, tlsConn, base64.StdEncoding.EncodeToString([]byte("jon")), "334")
+	cmdCode(t, tlsConn, base64.StdEncoding.EncodeToString([]byte("password")), "235")
+
+	cmdCode(t, tlsConn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, tlsConn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, tlsConn, "DATA", "354")
+	cmdCode(t, tlsConn, "Test message\r\n.", "250")
+
+	cmdCode(t, tlsConn, "QUIT", "221")
+	tlsConn.Close()
+
+	if ctxUsername != "jon" {
+		t.Errorf("Expected username on the mail handler to 'jon', got %s", ctxUsername)
+	}
 }
